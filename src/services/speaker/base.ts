@@ -100,6 +100,11 @@ export class BaseSpeaker {
   wakeUpCommand: ActionCommand;
   playingCommand?: PropertyCommand;
 
+  // 添加新属性来跟踪上次 unWakeUp 的时间
+  private _lastUnwakeTime?: number;
+  private _ttsBuffer = '';
+  private _ttsBufferTimeout?: NodeJS.Timeout;
+
   constructor(config: BaseSpeakerConfig) {
     this.config = config;
     this.config.timeout = config.timeout ?? 5000;
@@ -114,17 +119,98 @@ export class BaseSpeaker {
       wakeUpCommand = [5, 3],
       audioBeep = process.env.AUDIO_BEEP,
     } = config;
+
+    // 检查配置中的命令是否被颠倒了
+    if (config.ttsCommand && config.ttsCommand[0] === 5 && config.ttsCommand[1] === 3) {
+      this.logger.log('⚠️ 检测到 ttsCommand 可能配置错误，应为 [5,1] 而不是 [5,3]');
+      this.ttsCommand = [5, 1]; // 强制修正
+    } else {
+      this.ttsCommand = ttsCommand;
+    }
+    
+    if (config.wakeUpCommand && config.wakeUpCommand[0] === 5 && config.wakeUpCommand[1] === 1) {
+      this.logger.log('⚠️ 检测到 wakeUpCommand 可能配置错误，应为 [5,3] 而不是 [5,1]');
+      this.wakeUpCommand = [5, 3]; // 强制修正
+    } else {
+      this.wakeUpCommand = wakeUpCommand;
+    }
+    
     this.debug = debug;
     this.streamResponse = streamResponse;
     this.audioBeep = audioBeep;
     this.checkInterval = clamp(checkInterval, 500, Infinity);
     this.checkTTSStatusAfter = checkTTSStatusAfter;
     this.tts = tts;
+    if (this.tts === 'custom') {
+        // 使用 void 操作符来正确处理异步操作
+        void this.testTTSService().then(success => {
+            if (!success) {
+                this.logger.error('⚠️ TTS 服务测试失败，将回退到小爱默认 TTS');  // 将 log 改为 error
+                this.tts = 'xiaoai';
+            }
+        });
+    }
     // todo 考虑维护常见设备型号的指令列表，并自动从 spec 文件判断属性权限
     this.ttsCommand = ttsCommand;
     this.wakeUpCommand = wakeUpCommand;
     this.playingCommand = playingCommand;
   }
+
+  private async testTTSService() {
+    try {
+        this.logger.log('开始测试 TTS 服务...');
+        this.logger.log('TTS_BASE_URL:', process.env.TTS_BASE_URL);
+        
+        if (!process.env.TTS_BASE_URL) {
+            this.logger.error('TTS_BASE_URL 未配置');
+            return false;
+        }
+
+        // 首先测试 speakers 接口
+        this.logger.log('测试 speakers 接口...');
+        const speakersUrl = `${process.env.TTS_BASE_URL}/are-you-ok/api/speakers`;
+        const speakersResponse = await fetch(speakersUrl, {
+            headers: {
+                'Accept': 'application/json'
+            }
+        });
+        if (!speakersResponse.ok) {
+            this.logger.error('speakers 接口测试失败:', speakersResponse.statusText);
+            return false;
+        }
+        this.logger.log('speakers 接口测试成功');
+
+        // 然后测试 tts 接口
+        const testUrl = `${process.env.TTS_BASE_URL}/are-you-ok/api/tts.mp3?speaker=S_TDTaLFJj1&text=测试`;
+        this.logger.log('测试 TTS URL:', testUrl);
+        
+        const response = await fetch(testUrl, {
+            headers: {
+                'Accept': 'audio/mpeg'
+            }
+        });
+        this.logger.log('TTS 测试响应状态:', response.status);
+        
+        if (!response.ok) {
+            this.logger.error('TTS 服务测试失败:', response.statusText);
+            return false;
+        }
+
+        // 验证响应内容类型
+        const contentType = response.headers.get('content-type');
+        if (!contentType || !contentType.includes('audio/mpeg')) {
+            this.logger.error('TTS 响应类型错误:', contentType);
+            return false;
+        }
+
+        this.logger.log('TTS 服务测试成功');
+        return true;
+    } catch (error) {
+        this.logger.error('TTS 服务连接失败:', error);
+        return false;
+    }
+}
+
 
   async initMiServices() {
     this.MiNA = await getMiNA(this.config);
@@ -163,6 +249,16 @@ export class BaseSpeaker {
   }
 
   async unWakeUp() {
+    // 避免频繁调用 unWakeUp
+    const now = Date.now();
+    if (this._lastUnwakeTime && now - this._lastUnwakeTime < 3000) {
+      if (this.debug) {
+        this.logger.debug("跳过 unWakeUp (3秒内已调用过)");
+      }
+      return;
+    }
+    
+    this._lastUnwakeTime = now;
     if (this.debug) {
       this.logger.debug("unWakeUp");
     }
@@ -314,6 +410,7 @@ export class BaseSpeaker {
     // 播放回复
     const play = async (args?: { tts?: string; url?: string }) => {
       this.logger.log("🔊 " + (ttsText ?? audio));
+      
       // 播放开始提示音
       if (playSFX && this.audioBeep) {
         if (this.debug) {
@@ -321,15 +418,42 @@ export class BaseSpeaker {
         }
         await this.MiNA!.play({ url: this.audioBeep });
       }
-      // 在播放 TTS 语音之前，先取消小爱音箱的唤醒状态，防止将 TTS 语音识别成用户指令
+      
+      // 优化 unWakeUp 调用
       if (ttsNotXiaoai) {
-        await this.unWakeUp();
+        await this.unWakeUp(); // 已经在方法内部添加了频率限制
       }
-      if (args?.tts) {
-        await this.MiIOT!.doAction(...this.ttsCommand, args.tts);
-      } else {
-        await this.MiNA!.play(args);
+      
+      // 添加错误处理和重试机制
+      let retryCount = 0;
+      const maxRetries = 3;
+      
+      while (retryCount < maxRetries) {
+        try {
+          if (args?.tts) {
+            await this.MiIOT!.doAction(...this.ttsCommand, args.tts);
+          } else if (args?.url) {
+            await this.MiNA!.play(args);
+          }
+          break; // 成功则跳出循环
+        } catch (error) {
+          retryCount++;
+          this.logger.error(`TTS/播放失败 (尝试 ${retryCount}/${maxRetries}):`, error);
+          if (retryCount >= maxRetries) {
+            this.logger.error('达到最大重试次数，放弃此次播放');
+            return "error";
+          }
+          await sleep(500); // 等待500ms后重试
+        }
       }
+      
+      // 删除这段重复代码
+      // if (args?.tts) {
+      //   await this.MiIOT!.doAction(...this.ttsCommand, args.tts);
+      // } else {
+      //   await this.MiNA!.play(args);
+      // }
+      
       if (!this.streamResponse) {
         // 非流式响应，直接返回，不再等待设备播放完毕
         // todo 考虑后续通过 MIoT 通知事件，接收设备播放状态变更通知。
@@ -396,12 +520,48 @@ export class BaseSpeaker {
       // 文字回复
       switch (tts) {
         case "custom":
-          const _text = encodeURIComponent(ttsText);
-          const url = `${process.env.TTS_BASE_URL}/tts.mp3?speaker=${
-            speaker || ""
-          }&text=${_text}`;
-          res = await play({ url });
-          break;
+            const _text = encodeURIComponent(ttsText);
+            const url = `${process.env.TTS_BASE_URL}/are-you-ok/api/tts.mp3?speaker=${
+                speaker || "S_TDTaLFJj1"
+            }&text=${_text}`;
+            
+            this.logger.log('发送 TTS 请求:', url);
+            try {
+                const response = await fetch(url, {
+                    headers: {
+                        'Accept': 'audio/mpeg'
+                    }
+                });
+                this.logger.log('TTS 响应状态:', response.status);
+                
+                if (!response.ok) {
+                    this.logger.error('TTS 请求失败:', response.statusText);
+                    return "error";
+                }
+                
+                // 验证响应内容类型
+                const contentType = response.headers.get('content-type');
+                if (!contentType || !contentType.includes('audio/mpeg')) {
+                    this.logger.error('TTS 响应类型错误:', contentType);
+                    return "error";
+                }
+                
+                // 确保获取到音频数据
+                const audioBlob = await response.blob();
+                if (audioBlob.size === 0) {
+                    this.logger.error('TTS 响应数据为空');
+                    return "error";
+                }
+                // 创建临时 URL 用于播放
+                const audioUrl = URL.createObjectURL(audioBlob);
+                res = await play({ url: audioUrl });
+                // 清理临时 URL
+                URL.revokeObjectURL(audioUrl);
+            } catch (error) {
+                this.logger.error('TTS 请求异常:', error);
+                return "error";
+            }
+            break;
         case "xiaoai":
         default:
           res = await play({ tts: ttsText });
@@ -415,7 +575,7 @@ export class BaseSpeaker {
   private _currentSpeaker: string | undefined;
   async switchSpeaker(speaker: string) {
     if (!this._speakers && process.env.TTS_BASE_URL) {
-      const resp = await fetch(`${process.env.TTS_BASE_URL}/speakers`).catch(
+      const resp = await fetch(`${process.env.TTS_BASE_URL}/are-you-ok/api/speakers`).catch(
         () => null
       );
       const res = await resp?.json().catch(() => null);

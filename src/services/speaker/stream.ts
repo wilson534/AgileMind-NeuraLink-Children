@@ -162,13 +162,27 @@ export class StreamResponse {
   }
 
   private _findLastCutIndex(text: string): number {
-    const punctuations = "。？！；?!;";
-    let lastCutIndex = -1;
-    for (let i = 0; i < Math.min(text.length, this.maxSentenceLength); i++) {
-      if (punctuations.includes(text[i])) {
-        lastCutIndex = i + 1;
-      }
+    // 优化分段逻辑，优先在句号、问号、感叹号处分段
+    const sentenceEndMatch = text.match(/[。！？!?\.]["""」）)]*$/);
+    if (sentenceEndMatch) {
+      return sentenceEndMatch.index! + sentenceEndMatch[0].length;
     }
-    return lastCutIndex;
+    
+    // 其次在逗号、分号、顿号处分段
+    const commaMatch = text.match(/[，；、,:;]["""」）)]*$/);
+    if (commaMatch && text.length > this.maxSentenceLength / 2) {
+      return commaMatch.index! + commaMatch[0].length;
+    }
+    
+    // 如果文本长度超过最大长度，强制在空格或其他合适位置分段
+    if (text.length >= this.maxSentenceLength) {
+      const spaceMatch = text.substring(0, this.maxSentenceLength).match(/\s[^\s]*$/);
+      if (spaceMatch) {
+        return spaceMatch.index!;
+      }
+      return this.maxSentenceLength;
+    }
+    
+    return 0; // 不分段
   }
 }

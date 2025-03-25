@@ -42,12 +42,21 @@ export class MiGPT {
       "请使用 MiGPT.create() 获取客户端实例！"
     );
     const { speaker, ...myBotConfig } = config;
+    
+    // 检查配置加载情况
+    MiGPT.logger.log("配置加载检查:", {
+      migptConfig: config,
+      speakerConfig: speaker,
+      ttsType: speaker.tts,
+      envTTSUrl: process.env.TTS_BASE_URL
+    });
+    
     this.speaker = new AISpeaker(speaker);
     this.ai = new MyBot({
       ...myBotConfig,
       speaker: this.speaker,
     });
-  }
+}
 
   async start() {
     await initDB(this.speaker.debug);

@@ -7,6 +7,9 @@ import { QueryMessage, SpeakerAnswer } from "../speaker/speaker";
 import { StreamResponse } from "../speaker/stream";
 import { IBotConfig } from "./config";
 import { ConversationManager, MessageContext } from "./conversation";
+import { coze } from "../coze";  // 确保导入 coze
+import { kEnvs, isCozeEnabled } from "../../utils/env";  // 添加 isCozeEnabled 导入
+import { Logger } from "../../utils/log";  // 添加这行导入
 
 const kDefaultSystemTemplate = `
 请重置所有之前的上下文、文件和指令。现在，你将扮演一个名为{{botName}}的角色，使用第一人称视角回复消息。
@@ -99,7 +102,7 @@ export class MyBot {
         if (config) {
           this.speaker.name = config?.bot.name;
           await this.speaker.response({
-            text: `你好，我是${name}，很高兴认识你！`,
+            text: `你好，我是${name}，高兴认识你！`,
             keepAlive: this.speaker.keepAlive,
           });
         } else {
@@ -218,27 +221,64 @@ export class MyBot {
   ) {
     const requestId = randomUUID();
     const stream = new StreamResponse({ firstSubmitTimeout: 3 * 1000 });
-    openai
-      .chatStream({
+    
+    const logger = Logger.create({ tag: "Bot" });
+    
+    // 使用导出的函数判断是否启用Coze
+    const useCoze = isCozeEnabled();
+    logger.log('环境变量检查:', {
+      USE_COZE_ENV: process.env.USE_COZE,
+      USE_COZE_KENVS: kEnvs.USE_COZE,
+      USE_COZE_PARSED: useCoze,
+      FINAL_DECISION: useCoze
+    });
+    
+    const aiService = useCoze ? coze : openai;
+    logger.log(`使用AI服务: ${useCoze ? 'Coze' : 'OpenAI'}`);
+    
+    // 验证服务实例
+    logger.log('服务实例检查:', {
+      isCozeInstance: aiService === coze,
+      serviceType: aiService === coze ? 'Coze' : 'OpenAI'
+    });
+
+    try {
+      // 添加更多日志来调试
+      if (useCoze) {
+        logger.log('使用Coze服务', {
+          botId: (coze as any).botId,
+          baseUrl: (coze as any).baseUrl,
+          hasApiKey: Boolean((coze as any).apiKey)
+        });
+      }
+      
+      const result = await aiService.chatStream({
         ...options,
         requestId,
         trace: true,
-        onStream: (text) => {
+        onStream: (text: string) => {
           if (stream.status === "canceled") {
-            return openai.cancel(requestId);
+            aiService.cancel(requestId);
+            return;
           }
           stream.addResponse(text);
         },
-      })
-      .then((answer) => {
-        if (answer) {
-          stream.finish(answer);
-          options.onFinished?.(answer);
-        } else {
-          stream.finish(answer);
-          stream.cancel();
-        }
       });
-    return stream;
+
+      if (result) {
+        stream.finish(result);
+        options.onFinished?.(result);
+      } else {
+        stream.finish(undefined);
+        stream.cancel();
+      }
+
+      return stream;
+    } catch (error) {
+      // 添加更详细的错误日志
+      logger.error('AI服务请求失败:', error);
+      stream.cancel();
+      return stream;
+    }
   }
 }

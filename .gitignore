@@ -1,9 +1,43 @@
-node_modules
-dist
-.DS_Store
-.yarn
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# Build outputs
+dist/
+build/
+*.tsbuildinfo
+
+# Environment variables
 .env
-.bot.json
-.mi.json
-.migpt.js
-*.db*
+.env.local
+.env.*.local
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Testing
+coverage/
+.nyc_output/
+
+# Temporary files
+tmp/
+temp/
+
+# Debug
+.debug/
+
+# Custom application specific
+config.local.json
